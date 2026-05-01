@@ -1,6 +1,6 @@
 {
-  // our minimum supported Node version is Node v14
-  "extends": "@tsconfig/node14/tsconfig.json",
+  // our minimum supported Node version is Node v18.19
+  "extends": "@tsconfig/node18/tsconfig.json",
   "include": ["src/*"],
 
   "compilerOptions": {
@@ -19,6 +19,7 @@
     // next to the .js files
     // We can't use `dist/` as Vite will automatically overwrite it.
     "outDir": "dist-types",
+    "rootDir": ".",
     // go to js file when using IDE functions like
     // "Go to Definition" in VSCode
     "declarationMap": true,

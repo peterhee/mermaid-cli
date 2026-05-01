@@ -10,7 +10,7 @@ import { promisify } from 'util'
 // optional (automatically added by jest), but useful to have for your code editor/autocomplete
 import { expect, beforeAll, afterAll, describe, test } from '@jest/globals'
 
-import { run, renderMermaid, parseMMD } from '../src/index.js'
+import { run, renderMermaid } from '../src/index.js'
 import puppeteer from 'puppeteer'
 import { pipeline } from 'stream'
 
@@ -76,18 +76,18 @@ async function compileDiagram (workflow, file, format, { puppeteerConfigFile } =
 /**
  * Confirms the filetype of the given bytes
  *
- * @param {Buffer} bytes - The bytes of the file to check
+ * @param {Uint8Array} bytes - The bytes of the file to check
  * @param {"png"|"pdf"|"svg"} fileType - The filetype to check for
  */
 function expectBytesAreFormat (bytes, fileType) {
   switch (fileType) {
     // see https://en.wikipedia.org/wiki/List_of_file_signatures
     case 'png':
-      return expect(bytes.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+      return expect(new Uint8Array(bytes).subarray(0, 8)).toEqual(Uint8Array.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
     case 'pdf':
-      return expect(bytes.subarray(0, 5)).toEqual(Buffer.from('%PDF-', 'utf8'))
+      return expect(new Uint8Array(bytes).subarray(0, 5)).toEqual(Uint8Array.from(Buffer.from('%PDF-', 'utf8')))
     case 'svg':
-      return expect(bytes.subarray(0, 4)).toEqual(Buffer.from('<svg', 'utf8'))
+      return expect(new Uint8Array(bytes).subarray(0, 4)).toEqual(Uint8Array.from(Buffer.from('<svg', 'utf8')))
     default:
       throw new Error('Unsupported filetype')
   }
@@ -95,7 +95,7 @@ function expectBytesAreFormat (bytes, fileType) {
 
 let browser
 beforeAll(async () => {
-  browser = await puppeteer.launch()
+  browser = await puppeteer.launch({ headless: 'shell' })
 })
 afterAll(async () => {
   if (browser) {
@@ -177,10 +177,30 @@ describe('mermaid-cli', () => {
     expect(stderr).not.toContain('No input file specified, reading from stdin.')
   }, timeout)
 
+  test('should warn when outputting to stdout with missing --outputFormat', async () => {
+    const execFilePromise = promisify(execFile)('node', ['src/cli.js', '--output', '-'])
+    await promisify(pipeline)(
+      createReadStream('test-positive/flowchart1.mmd'),
+      execFilePromise.child.stdin
+    )
+    const { stderr } = await execFilePromise
+    expect(stderr).toContain('No output format specified, using svg.')
+  }, timeout)
+
+  test('should not warn when outputting to stdout with --outputFormat', async () => {
+    const execFilePromise = promisify(execFile)('node', ['src/cli.js', '--output', '-', '--outputFormat', 'svg'])
+    await promisify(pipeline)(
+      createReadStream('test-positive/flowchart1.mmd'),
+      execFilePromise.child.stdin
+    )
+    const { stderr } = await execFilePromise
+    expect(stderr).not.toContain('No output format specified, using svg.')
+  }, timeout)
+
   test('should error on mermaid syntax error', async () => {
     await expect(
       compileDiagram('test-negative', 'invalid.expect-error.mmd', 'svg')
-    ).rejects.toThrow('Error: Evaluation failed: Error: Parse error on line 2:')
+    ).rejects.toThrow('Error: Parse error on line 2:')
   }, timeout)
 
   test('should have 3 trailing spaces after ``` in test-positive/mermaid.md for case 9.', async () => {
@@ -268,6 +288,14 @@ describe('mermaid-cli', () => {
     expectBytesAreFormat(await fs.readFile(expectedOutputFile), 'png')
   }, timeout)
 
+  test('the id of <svg> can be set', async () => {
+    const outputFile = 'test-positive/flowchart1.mmd.svg'
+    await fs.rm(outputFile, { force: true })
+    await promisify(execFile)('node', ['src/cli.js', '-i', 'test-positive/flowchart1.mmd', '-o', outputFile, '-I', 'custom-id'])
+
+    expect((await fs.readFile(outputFile)).toString()).toMatch(/^<svg[^>]+id="custom-id"/)
+  }, timeout)
+
   test.concurrent.each(['svg', 'png', 'pdf'])('should set red background to %s', async (format) => {
     await promisify(execFile)('node', [
       'src/cli.js', '-i', 'test-positive/flowchart1.mmd', '-o', `test-output/flowchart1-red-background.${format}`,
@@ -291,10 +319,14 @@ describe('mermaid-cli', () => {
 })
 
 describe("NodeJS API (import ... from '@mermaid-js/mermaid-cli')", () => {
+  beforeAll(async () => {
+    await fs.mkdir(join(out, './svg/dist/'), { recursive: true })
+  })
+
   describe('run()', () => {
-    test('should write markdown output with svg images', async () => {
+    test.each([true, false])('should write markdown output with svg images - custom artefact path [%s]', async (artefact) => {
       const expectedOutputMd = 'test-output/mermaid-run-output-test-svg.md'
-      const expectedOutputSvgs = [1, 2, 3].map((i) => `test-output/mermaid-run-output-test-svg-${i}.svg`)
+      const expectedOutputSvgs = [1, 2, 3].map((i) => `test-output${artefact ? '/svg/dist' : ''}/mermaid-run-output-test-svg-${i}.svg`)
       // delete any files from previous test (fs.rm added in Node v14.14.0)
       await Promise.all(
         [
@@ -304,7 +336,7 @@ describe("NodeJS API (import ... from '@mermaid-js/mermaid-cli')", () => {
       )
 
       await run(
-        'test-positive/mermaid.md', expectedOutputMd, { quiet: true, outputFormat: 'svg' }
+        'test-positive/mermaid.md', expectedOutputMd, { quiet: true, outputFormat: 'svg', artefacts: artefact ? './test-output/svg/dist/' : undefined }
       )
 
       const markdownFile = await fs.readFile(expectedOutputMd, { encoding: 'utf8' })
@@ -382,7 +414,10 @@ describe("NodeJS API (import ... from '@mermaid-js/mermaid-cli')", () => {
           formats.push('markdown')
         }
         const shouldError = /expect-error/.test(file)
-        test.concurrent.each(formats)(`${shouldError ? 'should fail' : 'should compile'} ${file} to format %s`, async (format) => {
+        // markdown files render all their images in parallel, so doing lots
+        // of markdown files in parallel is expensive!
+        const runConcurrently = !/\.(md|markdown)$/.test(file);
+        (runConcurrently ? test.concurrent : test).each(formats)(`${shouldError ? 'should fail' : 'should compile'} ${file} to format %s`, async (format) => {
           const result = file.replace(/\.(?:mmd|md|markdown)$/, `-run.${format}`)
           const promise = run(join(workflow, file), join(out, result), { quiet: true })
           if (shouldError) {
@@ -395,19 +430,19 @@ describe("NodeJS API (import ... from '@mermaid-js/mermaid-cli')", () => {
     })
   })
 
-  describe('parseMMD()', () => {
+  describe('renderMermaid()', () => {
     test('should return bytes from mmd', async () => {
       const mmdInput = 'graph TD;\n    nA-->B;\n'
-      const bytes = await parseMMD(browser, mmdInput, 'svg')
-      expect(bytes).toBeInstanceOf(Buffer)
+      const { data: bytes } = await renderMermaid(browser, mmdInput, 'svg')
+      expect(bytes).toBeInstanceOf(Uint8Array)
       expectBytesAreFormat(bytes, 'svg')
     })
 
     test('should throw exception for invalid mmd', async () => {
       const invalidMMDInput = 'this is not a valid mermaid file'
       expect(
-        parseMMD(browser, invalidMMDInput, 'svg')
-      ).rejects.toThrow('Evaluation failed: UnknownDiagramError: No diagram type detected matching given configuration for text: this is not a valid mermaid file')
+        renderMermaid(browser, invalidMMDInput, 'svg')
+      ).rejects.toThrow('No diagram type detected matching given configuration for text: this is not a valid mermaid file')
     })
 
     describe.each(workflows)('testing workflow %s', (workflow) => {
@@ -421,24 +456,38 @@ describe("NodeJS API (import ... from '@mermaid-js/mermaid-cli')", () => {
         const shouldError = /expect-error/.test(file)
         test.concurrent.each(formats)(`${shouldError ? 'should fail' : 'should compile'} ${file} to format %s`, async (format) => {
           const mmd = await fs.readFile(join(workflow, file), { encoding: 'utf8' })
-          const promise = parseMMD(browser, mmd, format)
+          const promise = renderMermaid(browser, mmd, format)
           if (shouldError) {
             await expect(promise).rejects.toThrow()
           } else {
-            const outputFileBytes = await promise
+            const { data: outputFileBytes } = await promise
             expectBytesAreFormat(outputFileBytes, format)
           }
         }, timeout)
       }
     })
-  })
 
-  describe('renderMermaid()', () => {
     test('should return title/desc from mmd', async () => {
       const mmdInput = 'graph TD;\n    accTitle: Hi\n    accDescr: World\n    nA-->B;\n'
       const result = await renderMermaid(browser, mmdInput, 'svg')
       expect(result).toMatchObject({ title: 'Hi', desc: 'World' })
       expectBytesAreFormat(result.data, 'svg')
+    })
+
+    test('should show Iconify icon packs', async () => {
+      const mmdInput = 'architecture-beta\n    group aws(logos:aws)[AWS]'
+      const result = await renderMermaid(browser, mmdInput, 'svg', { iconPacks: ['@iconify-json/logos'] })
+      expectBytesAreFormat(result.data, 'svg')
+      const decoder = new TextDecoder()
+      expect(decoder.decode(result.data)).toContain('<path')
+    })
+
+    test('should show Iconify icon packs and named iconpacks', async () => {
+      const mmdInput = 'flowchart TD\n    aws@{ icon: "logos:aws" } \n    resource-groups@{ icon: "azure:resource-groups", label: "resource-groups" }'
+      const result = await renderMermaid(browser, mmdInput, 'svg', { iconPacks: ['@iconify-json/logos'], iconPacksNamesAndUrls: ['azure#https://raw.githubusercontent.com/NakayamaKento/AzureIcons/refs/heads/main/icons.json'] })
+      expectBytesAreFormat(result.data, 'svg')
+      const decoder = new TextDecoder()
+      expect(decoder.decode(result.data)).toContain('<path')
     })
   })
 })

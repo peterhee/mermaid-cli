@@ -6,7 +6,7 @@ A-->B("hello 🐛")
 2. git-graph.mmd
 ```mermaid
 gitGraph
-    % Need to manually set id, otherwise they are auto-generated
+    %% Need to manually set id, otherwise they are auto-generated
     commit id: "abcdef"
     commit id: "123456"
     branch feature
@@ -144,3 +144,26 @@ stateDiagram
 ```   
 
 **Warning**: do not delete the trailing spaces after the \`\`\`
+
+10. Flowchart with KaTeX in it
+
+```mermaid
+---
+title: My flowchart with KaTeX in it.
+---
+flowchart LR
+  A["$$x^2$$"] -->|"$$\sqrt{x+3}$$"| B("$$\frac{1}{2}$$")
+```
+
+11. Flowchart using Elk and handDrawn look
+
+```mermaid
+---
+config:
+    look: handDrawn
+    layout: elk
+    handDrawnSeed: 1 # this is so visual regression tests are constant
+---
+flowchart LR
+    A --> B --> C & D
+```

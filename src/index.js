@@ -1,16 +1,23 @@
 import { Command, Option, InvalidArgumentError } from 'commander'
 import chalk from 'chalk'
 import fs from 'fs'
+import { resolve } from 'import-meta-resolve'
 import path from 'path'
 import puppeteer from 'puppeteer'
 import url from 'url'
+import { version } from './version.js'
+import { Interceptor } from './puppeteerIntercept.js'
 
-// importing JSON is still experimental in Node.JS https://nodejs.org/docs/latest-v16.x/api/esm.html#json-modules
-import { createRequire } from 'module'
-const require = createRequire(import.meta.url)
-const pkg = require('../package.json')
 // __dirname is not available in ESM modules by default
 const __dirname = url.fileURLToPath(new url.URL('.', import.meta.url))
+
+/**
+ * ESM bundles. Our interceptor doesn't support loading ESM modules that load
+ * other modules using relative paths, so these have to no `dependencies`.
+ */
+const mermaidESMPath = path.resolve(path.dirname(url.fileURLToPath(resolve('mermaid', import.meta.url))), 'mermaid.esm.mjs')
+const elkESMPath = path.resolve(path.dirname(url.fileURLToPath(resolve('@mermaid-js/layout-elk', import.meta.url))), 'mermaid-layout-elk.esm.mjs')
+const zenumlESMPath = path.resolve(path.dirname(url.fileURLToPath(resolve('@mermaid-js/mermaid-zenuml', import.meta.url))), 'mermaid-zenuml.esm.mjs')
 
 /**
  * Prints an error to stderr, then closes with exit code 1
@@ -91,7 +98,7 @@ async function getInputData (inputFile) {
 function parseCommanderInt (value, _unused) {
   const parsedValue = parseInt(value, 10)
   if (isNaN(parsedValue) || parsedValue < 1) {
-    throw new InvalidArgumentError('Not an positive integer.')
+    throw new InvalidArgumentError('Not a positive integer.')
   }
   return parsedValue
 }
@@ -99,25 +106,29 @@ function parseCommanderInt (value, _unused) {
 async function cli () {
   const commander = new Command()
   commander
-    .version(pkg.version)
+    .version(version)
     .addOption(new Option('-t, --theme [theme]', 'Theme of the chart').choices(['default', 'forest', 'dark', 'neutral']).default('default'))
     .addOption(new Option('-w, --width [width]', 'Width of the page').argParser(parseCommanderInt).default(800))
     .addOption(new Option('-H, --height [height]', 'Height of the page').argParser(parseCommanderInt).default(600))
-    .option('-i, --input <input>', 'Input mermaid file. Files ending in .md will be treated as Markdown and all charts (e.g. ```mermaid (...)```) will be extracted and generated. Use `-` to read from stdin.')
-    .option('-o, --output [output]', 'Output file. It should be either md, svg, png or pdf. Optional. Default: input + ".svg"')
+    .option('-i, --input <input>', 'Input mermaid file. Files ending in .md will be treated as Markdown and all charts (e.g. ```mermaid (...)``` or :::mermaid (...):::) will be extracted and generated. Use `-` to read from stdin.')
+    .option('-o, --output [output]', 'Output file. It should be either md, svg, png, pdf or use `-` to output to stdout. Optional. Default: input + ".svg"')
+    .option('-a, --artefacts [artefacts]', 'Output artefacts path. Only used with Markdown input file. Optional. Default: output directory')
     .addOption(new Option('-e, --outputFormat [format]', 'Output format for the generated image.').choices(['svg', 'png', 'pdf']).default(null, 'Loaded from the output file extension'))
     .addOption(new Option('-b, --backgroundColor [backgroundColor]', 'Background color for pngs/svgs (not pdfs). Example: transparent, red, \'#F0F0F0\'.').default('white'))
     .option('-c, --configFile [configFile]', 'JSON configuration file for mermaid.')
     .option('-C, --cssFile [cssFile]', 'CSS file for the page.')
+    .option('-I, --svgId [svgId]', 'The id attribute for the SVG element to be rendered.')
     .addOption(new Option('-s, --scale [scale]', 'Puppeteer scale factor').argParser(parseCommanderInt).default(1))
     .option('-f, --pdfFit', 'Scale PDF to fit chart')
     .option('-q, --quiet', 'Suppress log output')
     .option('-p --puppeteerConfigFile [puppeteerConfigFile]', 'JSON configuration file for puppeteer.')
+    .option('--iconPacks <icons...>', 'Icon packs to use, e.g. @iconify-json/logos. These should be Iconify NPM packages that expose a icons.json file, see https://iconify.design/docs/icons/json.html. These will be downloaded from https://unkpg.com when needed.', [])
+    .option('--iconPacksNamesAndUrls <prefix#iconsurl...>', 'Icon packs to use, e.g. azure#https://raw.githubusercontent.com/NakayamaKento/AzureIcons/refs/heads/main/icons.json where the name (prefix) of the icon pack is defined before the "#" and the url of the json definition after the "#". These should be Iconify json file formatted as IconifyJson, see https://iconify.design/docs/icons/json.html. These will be downloaded when needed.', [])
     .parse(process.argv)
 
   const options = commander.opts()
 
-  let { theme, width, height, input, output, outputFormat, backgroundColor, configFile, cssFile, puppeteerConfigFile, scale, pdfFit, quiet } = options
+  let { theme, width, height, input, output, outputFormat, backgroundColor, configFile, cssFile, svgId, puppeteerConfigFile, scale, pdfFit, quiet, iconPacks, iconPacksNamesAndUrls, artefacts } = options
 
   // check input file
   if (!input) {
@@ -142,12 +153,33 @@ async function cli () {
     } else {
       output = input ? (`${input}.svg`) : 'out.svg'
     }
-  }
-  if (!/\.(?:svg|png|pdf|md|markdown)$/.test(output)) {
+  } else if (output === '-') {
+    // `--output -` means write to stdout.
+    output = '/dev/stdout'
+    quiet = true
+
+    if (!outputFormat) {
+      outputFormat = 'svg'
+      warn('No output format specified, using svg. ' +
+        'If you want to specify an output format and suppress this warning, ' +
+        'please use `-e <format>.` '
+      )
+    }
+  } else if (!/\.(?:svg|png|pdf|md|markdown)$/.test(output)) {
     error('Output file must end with ".md"/".markdown", ".svg", ".png" or ".pdf"')
   }
+
+  if (artefacts) {
+    if (!input || !/\.(?:md|markdown)$/.test(input)) {
+      error('Artefacts [-a|--artefacts] path can only be used with Markdown input file')
+    }
+    if (!fs.existsSync(artefacts)) {
+      fs.mkdirSync(artefacts, { recursive: true })
+    }
+  }
+
   const outputDir = path.dirname(output)
-  if (!fs.existsSync(outputDir)) {
+  if (output !== '/dev/stdout' && !fs.existsSync(outputDir)) {
     error(`Output directory "${outputDir}/" doesn't exist`)
   }
 
@@ -157,15 +189,14 @@ async function cli () {
     checkConfigFile(configFile)
     mermaidConfig = Object.assign(mermaidConfig, JSON.parse(fs.readFileSync(configFile, 'utf-8')))
   }
-  // @ts-expect-error Setting headless to `1` is not officially supported
-  let puppeteerConfig = /** @type {import('puppeteer').PuppeteerLaunchOptions} */ ({
+
+  let puppeteerConfig = /** @type {import('puppeteer').LaunchOptions} */ ({
     /*
-     * `headless: 1` is not officially supported, but setting this to any
-     * non-`true` truthy value doesn't change any behavior, but it hides the
-     * Puppeteer old Headless deprecation warning,
-     * see https://github.com/argos-ci/jest-puppeteer/issues/553#issuecomment-1561826456
+     * `headless: 'shell'` is not officially supported in Puppeteer v19, v20, v21,
+     * but still works. In Puppeteer v22, it uses the `chrome-headless-shell` package,
+     * which is much faster than the regular headless mode.
      */
-    headless: 1
+    headless: 'shell'
   })
   if (puppeteerConfigFile) {
     checkConfigFile(puppeteerConfigFile)
@@ -187,8 +218,9 @@ async function cli () {
       quiet,
       outputFormat,
       parseMMDOptions: {
-        mermaidConfig, backgroundColor, myCSS, pdfFit, viewport: { width, height, deviceScaleFactor: scale }
-      }
+        mermaidConfig, backgroundColor, myCSS, pdfFit, viewport: { width, height, deviceScaleFactor: scale }, svgId, iconPacks, iconPacksNamesAndUrls
+      },
+      artefacts
     }
   )
 }
@@ -200,39 +232,24 @@ async function cli () {
  * @property {Parameters<import("mermaid")["default"]["initialize"]>[0]} [mermaidConfig] - Mermaid config.
  * @property {CSSStyleDeclaration["cssText"]} [myCSS] - Optional CSS text.
  * @property {boolean} [pdfFit] - If set, scale PDF to fit chart.
- */
-
-/**
- * Parse and render a mermaid diagram.
- *
- * @deprecated Prefer {@link renderMermaid}, as it also returns useful metadata.
- *
- * @param {import("puppeteer").Browser} browser - Puppeteer Browser
- * @param {string} definition - Mermaid diagram definition
- * @param {"svg" | "png" | "pdf"} outputFormat - Mermaid output format.
- * @param {ParseMDDOptions} [opt] - Options, see {@link ParseMDDOptions} for details.
- *
- * @returns {Promise<Buffer>} The output file in bytes.
- */
-async function parseMMD (browser, definition, outputFormat, opt) {
-  const { data } = await renderMermaid(browser, definition, outputFormat, opt)
-  return data
-}
+ * @property {string} [svgId] - The id attribute for the SVG element to be rendered.
+ * @property {string[]} [iconPacks] - Icon packages to use.
+ * @property {string[]} [iconPacksNamesAndUrls] - IconPack Json file name and url to use.
 
 /**
  * Render a mermaid diagram.
  *
- * @param {import("puppeteer").Browser} browser - Puppeteer Browser
+ * @param {import("puppeteer").Browser | import("puppeteer").BrowserContext} browser - Puppeteer Browser
  * @param {string} definition - Mermaid diagram definition
  * @param {"svg" | "png" | "pdf"} outputFormat - Mermaid output format.
  * @param {ParseMDDOptions} [opt] - Options, see {@link ParseMDDOptions} for details.
- * @returns {Promise<{title: string | null, desc: string | null, data: Buffer}>} The output file in bytes,
+ * @returns {Promise<{title: string | null, desc: string | null, data: Uint8Array}>} The output file in bytes,
  * with optional metadata.
  */
-async function renderMermaid (browser, definition, outputFormat, { viewport, backgroundColor = 'white', mermaidConfig = {}, myCSS, pdfFit } = {}) {
+async function renderMermaid (browser, definition, outputFormat, { viewport, backgroundColor = 'white', mermaidConfig = {}, myCSS, pdfFit, svgId, iconPacks = [], iconPacksNamesAndUrls = [] } = {}) {
   const page = await browser.newPage()
   page.on('console', (msg) => {
-    console.log(msg.text())
+    console.warn(msg.text())
   })
   try {
     if (viewport) {
@@ -243,18 +260,56 @@ async function renderMermaid (browser, definition, outputFormat, { viewport, bac
     await page.$eval('body', (body, backgroundColor) => {
       body.style.background = backgroundColor
     }, backgroundColor)
-    const metadata = await page.$eval('#container', async (container, definition, mermaidConfig, myCSS, backgroundColor) => {
-      /**
-       * @typedef {Object} GlobalThisWithMermaid
-       * We've already imported these modules in our `index.html` file, so that they
-       * get correctly bundled.
-       * @property {import("mermaid")["default"]} mermaid Already imported mermaid instance
-       */
-      const { mermaid } = /** @type {GlobalThisWithMermaid & typeof globalThis} */ (globalThis)
 
+    const interceptor = new Interceptor()
+    const mermaidUrl = await interceptor.fileUrlToInterceptUrl(url.pathToFileURL(mermaidESMPath))
+    const elkUrl = await interceptor.fileUrlToInterceptUrl(url.pathToFileURL(elkESMPath))
+    const zenumlUrl = await interceptor.fileUrlToInterceptUrl(url.pathToFileURL(zenumlESMPath))
+
+    page.on('request', interceptor.interceptRequestHandler)
+    await page.setRequestInterception(true)
+
+    const metadata = await page.$eval('#container', async (container, { definition, mermaidConfig, myCSS, backgroundColor, svgId, iconPacks, iconPacksNamesAndUrls, elkUrl, mermaidUrl, zenumlUrl }) => {
+      const { default: mermaid } = await import(mermaidUrl)
+      const { default: elkLayouts } = await import(elkUrl)
+      const { default: zenuml } = await import(zenumlUrl)
+      await Promise.all(Array.from(document.fonts, (font) => font.load()))
+
+      await mermaid.registerExternalDiagrams([zenuml])
+      mermaid.registerLayoutLoaders(elkLayouts)
+      // lazy load icon packs
+
+      mermaid.registerIconPacks(
+        iconPacks.map((icon) => ({
+          name: icon.split('/')[1],
+          loader: () =>
+            fetch(`https://unpkg.com/${icon}/icons.json`)
+              .then((res) => res.json())
+              .catch(() => error(`Failed to fetch icon: ${icon}`))
+        }))
+      )
+
+      mermaid.registerIconPacks(
+        iconPacksNamesAndUrls.map((iconPackInfo) => {
+          const packName = iconPackInfo.split('#')[0]
+          const packUrl = iconPackInfo.split('#')[1]
+
+          return ({
+            name: packName,
+            loader: () =>
+              fetch(packUrl)
+                .then((res) => res.json())
+                .catch(() => {
+                  error(`Failed to fetch icon: ${iconPackInfo}`)
+                })
+          }
+          )
+        }
+        )
+      )
       mermaid.initialize({ startOnLoad: false, ...mermaidConfig })
       // should throw an error if mmd diagram is invalid
-      const { svg: svgText } = await mermaid.render('my-svg', definition, container)
+      const { svg: svgText } = await mermaid.render(svgId || 'my-svg', definition, container)
       container.innerHTML = svgText
 
       const svg = container.getElementsByTagName?.('svg')?.[0]
@@ -290,7 +345,7 @@ async function renderMermaid (browser, definition, outputFormat, { viewport, bac
       return {
         title, desc
       }
-    }, definition, mermaidConfig, myCSS, backgroundColor)
+    }, { definition, mermaidConfig, myCSS, backgroundColor, svgId, iconPacks, iconPacksNamesAndUrls, elkUrl, mermaidUrl, zenumlUrl })
 
     if (outputFormat === 'svg') {
       const svgXML = await page.$eval('svg', (svg) => {
@@ -303,7 +358,7 @@ async function renderMermaid (browser, definition, outputFormat, { viewport, bac
       })
       return {
         ...metadata,
-        data: Buffer.from(svgXML, 'utf8')
+        data: new TextEncoder().encode(svgXML)
       }
     } else if (outputFormat === 'png') {
       const clip = await page.$eval('svg', svg => {
@@ -346,7 +401,7 @@ async function renderMermaid (browser, definition, outputFormat, { viewport, bac
 
 /**
  * @typedef {object} MarkdownImageProps Markdown image properties
- * Used to create an markdown image that looks like `![alt](url "title")`
+ * Used to create a markdown image that looks like `![alt](url "title")`
  * @property {string} url - Path to image.
  * @property {string} alt - Image alt text, required.
  * @property {string | null} [title] - Optional image title text.
@@ -376,15 +431,16 @@ function markdownImage ({ url, title, alt }) {
  * path to a markdown file containing mermaid.
  * If this is a string, loads the mermaid definition from the given file.
  * If this is `undefined`, loads the mermaid definition from stdin.
- * @param {`${string}.${"md" | "markdown" | "svg" | "png" | "pdf"}`} output - Path to the output file.
+ * @param {`${string}.${"md" | "markdown" | "svg" | "png" | "pdf"}` | "/dev/stdout"} output - Path to the output file.
  * @param {Object} [opts] - Options
  * @param {import("puppeteer").LaunchOptions} [opts.puppeteerConfig] - Puppeteer launch options.
  * @param {boolean} [opts.quiet] - If set, suppress log output.
  * @param {"svg" | "png" | "pdf"} [opts.outputFormat] - Mermaid output format.
+ * @param {string} [opts.artefacts] - Path to the artefacts directory.
  * Defaults to `output` extension. Overrides `output` extension if set.
  * @param {ParseMDDOptions} [opts.parseMMDOptions] - Options to pass to {@link parseMMDOptions}.
  */
-async function run (input, output, { puppeteerConfig = {}, quiet = false, outputFormat, parseMMDOptions } = {}) {
+async function run (input, output, { puppeteerConfig = {}, quiet = false, outputFormat, parseMMDOptions, artefacts } = {}) {
   /**
    * Logs the given message to stdout, unless `quiet` is set to `true`.
    *
@@ -397,9 +453,13 @@ async function run (input, output, { puppeteerConfig = {}, quiet = false, output
   }
 
   // TODO: should we use a Markdown parser like remark instead of rolling our own parser?
-  const mermaidChartsInMarkdown = /^[^\S\n]*```(?:mermaid)([^\S\n]*\r?\n([\s\S]*?))```[^\S\n]*$/
+  const mermaidChartsInMarkdown = /^[^\S\n]*[`:]{3}(?:mermaid)([^\S\n]*\r?\n([\s\S]*?))[`:]{3}[^\S\n]*$/
   const mermaidChartsInMarkdownRegexGlobal = new RegExp(mermaidChartsInMarkdown, 'gm')
-  const browser = await puppeteer.launch(puppeteerConfig)
+  /**
+   * @type {puppeteer.Browser | undefined}
+   * Lazy-loaded browser instance, only created when needed.
+   */
+  let browser
   try {
     if (!outputFormat) {
       const outputFormatFromFilename =
@@ -419,8 +479,15 @@ async function run (input, output, { puppeteerConfig = {}, quiet = false, output
 
     const definition = await getInputData(input)
     if (input && /\.(md|markdown)$/.test(input)) {
+      if (output === '/dev/stdout') {
+        throw new Error('Cannot use `stdout` with markdown input')
+      }
+
       const imagePromises = []
       for (const mermaidCodeblockMatch of definition.matchAll(mermaidChartsInMarkdownRegexGlobal)) {
+        if (browser === undefined) {
+          browser = await puppeteer.launch(puppeteerConfig)
+        }
         const mermaidDefinition = mermaidCodeblockMatch[2]
 
         /** Output can be either a template image file, or a `.md` output file.
@@ -430,10 +497,15 @@ async function run (input, output, { puppeteerConfig = {}, quiet = false, output
          *     I.e. if "out.md". use "out-1.svg", "out-2.svg", etc
          * @type {string}
          */
-        const outputFile = output.replace(
+        let outputFile = output.replace(
           /(\.(md|markdown|png|svg|pdf))$/,
           `-${imagePromises.length + 1}$1`
         ).replace(/\.(md|markdown)$/, `.${outputFormat}`)
+
+        if (artefacts) {
+          outputFile = path.resolve(artefacts, path.basename(outputFile))
+        }
+
         const outputFileRelative = `./${path.relative(path.dirname(path.resolve(output)), path.resolve(outputFile))}`
 
         const imagePromise = (async () => {
@@ -474,12 +546,15 @@ async function run (input, output, { puppeteerConfig = {}, quiet = false, output
       }
     } else {
       info('Generating single mermaid chart')
-      const data = await parseMMD(browser, definition, outputFormat, parseMMDOptions)
-      await fs.promises.writeFile(output, data)
+      browser = await puppeteer.launch(puppeteerConfig)
+      const { data } = await renderMermaid(browser, definition, outputFormat, parseMMDOptions)
+      await output !== '/dev/stdout'
+        ? fs.promises.writeFile(output, data)
+        : process.stdout.write(data)
     }
   } finally {
-    await browser.close()
+    await browser?.close?.()
   }
 }
 
-export { run, renderMermaid, parseMMD, cli, error }
+export { run, renderMermaid, cli, error }

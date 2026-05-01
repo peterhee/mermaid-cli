@@ -4,6 +4,15 @@ IMAGETAG=$2
 
 set -e
 
+# If no image tag is provided, build the Docker image
+if [ -z "$IMAGETAG" ]; then
+  echo "No image tag provided, building Docker image..."
+  # Get the current package version from package.json
+  VERSION=$(node -p "require('./package.json').version")
+  IMAGETAG="mermaid-cli:test"
+  docker build --build-arg VERSION=$VERSION -t $IMAGETAG -f DockerfileBuild .
+fi
+
 # we must set `useMaxWidth: false` in config` to convert-svg-to-png for Percy CI
 config_noUseMaxWidth="$INPUT_DATA/config-noUseMaxWidth.json"
 
@@ -40,6 +49,21 @@ for format in "svg" "png"; do
     -o "$outputFileName"
 done
 
+# Test if passing custom Iconify icons work
+outputFileName="/data/$INPUT_DATA/architecture-diagram-logos-with-icons.png"
+docker run --rm -v $(pwd):/data $IMAGETAG \
+  -i /data/$INPUT_DATA/architecture-diagram-logos.mmd \
+  --iconPacks '@iconify-json/logos' \
+  -o "$outputFileName"
+
+# Test if passing custom Iconify icons (from unpkg and other sources) work
+outputFileName="/data/$INPUT_DATA/flowchart1.png"
+docker run --rm -v $(pwd):/data $IMAGETAG \
+  -i /data/$INPUT_DATA/flowchart1.mmd \
+  --iconPacks '@iconify-json/logos' \
+  --iconPacksNamesAndUrls "azure#https://raw.githubusercontent.com/NakayamaKento/AzureIcons/refs/heads/main/icons.json" \
+  -o "$outputFileName"
+
 # Test if a diagram from STDIN can be understood
 cat $INPUT_DATA/flowchart1.mmd | docker run --rm -i -v $(pwd):/data $IMAGETAG -o /data/$INPUT_DATA/flowchart1-stdin.png -w 800
 
@@ -57,3 +81,27 @@ if grep -q "<br>" "./test-positive/graph-with-br.mmd.svg"; then
   echo "<br> has not been replaced with <br/>";
   exit 1;
 fi
+
+mkdir ./test-output/
+
+# Run mmdc with --artefacts using existing test file
+docker run --rm -v $(pwd):/data $IMAGETAG \
+  -i /data/test-positive/mermaid.md \
+  -o /data/test-output/mermaid-artefacts.md \
+  --artefacts /data/static-out/
+
+# Verify that the images were created in the specified path
+if [ ! -f "./static-out/mermaid-artefacts-1.svg" ]; then
+  echo "Images were not created in the specified artefact path";
+  exit 1;
+fi
+
+# Verify that the generated markdown file contains the correct image links
+if ! grep -q "!\[diagram\](\.\/\.\.\/static-out\/mermaid-artefacts-1\.svg)" "./test-output/mermaid-artefacts.md"; then
+  echo "Generated markdown file does not contain the correct image links";
+  exit 1;
+fi
+
+# Clean up
+rm -rf ./static-out/
+rm -rf ./test-output/mermaid-artefacts.md
